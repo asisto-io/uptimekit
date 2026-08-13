@@ -21,6 +21,7 @@ import {
     isNull,
     ne,
     or,
+    sql,
 } from "drizzle-orm";
 import { cache } from "react";
 import {
@@ -72,6 +73,7 @@ async function getPublishedIncidentRecords(
         limit?: number;
         cutoff?: Date;
         maintenanceOnly?: boolean;
+        sortBy?: "startedAt" | "endedAt";
     },
 ) {
     const filters = [eq(incidentStatusPage.statusPageId, statusPageId)];
@@ -110,7 +112,13 @@ async function getPublishedIncidentRecords(
         .from(incidentStatusPage)
         .innerJoin(incident, eq(incident.id, incidentStatusPage.incidentId))
         .where(and(...filters))
-        .orderBy(desc(incident.startedAt))
+        .orderBy(
+            desc(
+                options?.sortBy === "endedAt"
+                    ? incident.endedAt
+                    : incident.startedAt,
+            ),
+        )
         .$dynamic();
 
     if (options?.limit) {
@@ -124,19 +132,49 @@ async function getPublishedIncidentRecords(
     }
 
     return db.query.incidentStatusPage.findMany({
+        columns: {
+            incidentId: true,
+            statusPageId: true,
+        },
         where: and(
             eq(incidentStatusPage.statusPageId, statusPageId),
             inArray(incidentStatusPage.incidentId, incidentIds),
         ),
         with: {
             incident: {
+                columns: {
+                    id: true,
+                    title: true,
+                    status: true,
+                    severity: true,
+                    description: true,
+                    startedAt: true,
+                    plannedEndAt: true,
+                    endedAt: true,
+                    createdAt: true,
+                },
                 with: {
                     monitors: {
+                        columns: {
+                            incidentId: true,
+                            monitorId: true,
+                        },
                         with: {
-                            monitor: true,
+                            monitor: {
+                                columns: {
+                                    id: true,
+                                    name: true,
+                                },
+                            },
                         },
                     },
                     activities: {
+                        columns: {
+                            id: true,
+                            message: true,
+                            type: true,
+                            createdAt: true,
+                        },
                         orderBy: [desc(incidentActivity.createdAt)],
                     },
                 },
@@ -224,24 +262,91 @@ export type StatusPageData = NonNullable<
     Awaited<ReturnType<typeof getStatusPageByDomain>>
 >;
 
+async function getStatusPageMonitorRecords(statusPageId: string) {
+    const records = await db.query.statusPageMonitor.findMany({
+        where: eq(statusPageMonitor.statusPageId, statusPageId),
+        columns: {
+            statusPageId: true,
+            monitorId: true,
+            groupId: true,
+            style: true,
+            description: true,
+            order: true,
+        },
+        with: {
+            monitor: {
+                columns: {
+                    id: true,
+                    name: true,
+                    type: true,
+                    workerIds: true,
+                    locations: true,
+                },
+            },
+            group: {
+                columns: {
+                    id: true,
+                    name: true,
+                    order: true,
+                    collapsible: true,
+                    defaultCollapsed: true,
+                },
+            },
+        },
+        orderBy: [asc(statusPageMonitor.order)],
+    });
+
+    const monitorIds = records.map((record) => record.monitor.id);
+
+    if (monitorIds.length === 0) {
+        return records;
+    }
+
+    const externalMonitorConfigs = await db
+        .select({ id: monitor.id, config: monitor.config })
+        .from(monitor)
+        .where(
+            and(
+                inArray(monitor.id, monitorIds),
+                or(
+                    eq(monitor.type, "instatus"),
+                    sql`${monitor.config}->>'componentId' IS NOT NULL`,
+                ),
+            ),
+        );
+    const configByMonitorId = new Map(
+        externalMonitorConfigs.map((record) => [record.id, record.config]),
+    );
+
+    return records.map((record) => ({
+        ...record,
+        monitor: {
+            ...record.monitor,
+            config: configByMonitorId.get(record.monitor.id) ?? null,
+        },
+    }));
+}
+
 export const getStatusPageByDomain = cache(async (domain: string) => {
     return withRetry(async () => {
         const page = await db.query.statusPage.findFirst({
             where: eq(statusPage.domain, domain),
+            columns: {
+                id: true,
+                name: true,
+                slug: true,
+                domain: true,
+                design: true,
+                public: true,
+                password: true,
+            },
         });
 
         if (!page) {
             return undefined;
         }
 
-        const monitors = await db.query.statusPageMonitor.findMany({
-            where: eq(statusPageMonitor.statusPageId, page.id),
-            with: {
-                monitor: true,
-                group: true,
-            },
-            orderBy: [asc(statusPageMonitor.order)],
-        });
+        const monitors = await getStatusPageMonitorRecords(page.id);
 
         return {
             ...page,
@@ -254,20 +359,22 @@ export const getStatusPageBySlug = cache(async (slug: string) => {
     return withRetry(async () => {
         const page = await db.query.statusPage.findFirst({
             where: eq(statusPage.slug, slug),
+            columns: {
+                id: true,
+                name: true,
+                slug: true,
+                domain: true,
+                design: true,
+                public: true,
+                password: true,
+            },
         });
 
         if (!page) {
             return undefined;
         }
 
-        const monitors = await db.query.statusPageMonitor.findMany({
-            where: eq(statusPageMonitor.statusPageId, page.id),
-            with: {
-                monitor: true,
-                group: true,
-            },
-            orderBy: [asc(statusPageMonitor.order)],
-        });
+        const monitors = await getStatusPageMonitorRecords(page.id);
 
         return {
             ...page,
@@ -356,6 +463,8 @@ export const getMaintenanceHistory = async (
             await getPublishedIncidentRecords(statusPageId, {
                 maintenanceOnly: true,
                 resolvedOnly: true,
+                sortBy: "endedAt",
+                limit,
             })
         )
             .map(mapPublishedMaintenanceRecord)
@@ -410,6 +519,8 @@ export const getMaintenanceHistoryForPeriod = async (
                 maintenanceOnly: true,
                 resolvedOnly: true,
                 cutoff: cutoff ?? undefined,
+                sortBy: "endedAt",
+                limit,
             })
         )
             .map(mapPublishedMaintenanceRecord)
